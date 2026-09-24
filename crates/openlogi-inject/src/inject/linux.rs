@@ -5,8 +5,12 @@
 //! (missing group membership or udev rule) every call logs a `warn` and returns
 //! without panicking.
 
+mod keymap;
+
+use std::collections::HashSet;
 use std::io;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode};
@@ -171,12 +175,64 @@ fn dispatch_scroll(dx: i8, dy: i8) {
     }
 }
 
-/// Not implemented yet: unicode text has no uinput encoding without a keymap.
+/// Pause between characters. uinput frames are ordered, but toolkits that
+/// coalesce key events (notably under XWayland) drop repeats that land in
+/// the same tick; a short gap keeps every character.
+const TYPE_TEXT_KEY_GAP: Duration = Duration::from_millis(3);
+
+/// Type `text` by resolving each character against the session's XKB layout
+/// (see [`keymap`]) and pressing the resulting chord. Characters the layout
+/// cannot produce fall back to the GTK/IBus unicode entry sequence
+/// (`Ctrl+Shift+U`, hex, `Space`), which covers most toolkits on GNOME.
 pub(super) fn type_text(text: &str) {
-    tracing::warn!(
+    let names = keymap::detect_layout();
+    let Some(map) = keymap::build_map(&names, &KEY_CAPABILITY_SET) else {
+        tracing::warn!(
+            layout = %names.layout,
+            variant = %names.variant,
+            "XKB layout failed to compile — TypeText skipped"
+        );
+        return;
+    };
+    tracing::debug!(
+        layout = %names.layout,
+        variant = %names.variant,
         chars = text.chars().count(),
-        "TypeText injection is not implemented on Linux yet"
+        "typing text through the session layout"
     );
+    for ch in text.chars() {
+        match ch {
+            '\n' => press_key(&[], KeyCode::KEY_ENTER),
+            '\t' => press_key(&[], KeyCode::KEY_TAB),
+            _ => match map.get(&ch) {
+                Some(stroke) => press_key(&stroke.mods, stroke.key),
+                None => type_unicode_fallback(ch, &map),
+            },
+        }
+        std::thread::sleep(TYPE_TEXT_KEY_GAP);
+    }
+}
+
+/// GTK/IBus unicode entry: `Ctrl+Shift+U`, the code point in hex, `Space`.
+/// Only reachable for characters outside the layout, so the hex digits
+/// themselves are looked up through the same map.
+fn type_unicode_fallback(ch: char, map: &std::collections::HashMap<char, keymap::Stroke>) {
+    let hex = format!("{:x}", u32::from(ch));
+    let Some(digits) = hex
+        .chars()
+        .map(|d| map.get(&d))
+        .collect::<Option<Vec<_>>>()
+    else {
+        tracing::warn!(?ch, "character unreachable on the session layout — skipped");
+        return;
+    };
+    press_key(&[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT], KeyCode::KEY_U);
+    std::thread::sleep(TYPE_TEXT_KEY_GAP);
+    for stroke in digits {
+        press_key(&stroke.mods, stroke.key);
+        std::thread::sleep(TYPE_TEXT_KEY_GAP);
+    }
+    press_key(&[], KeyCode::KEY_SPACE);
 }
 
 pub(super) fn run_apple_script(_src: &str) {
@@ -222,8 +278,13 @@ const KEY_CAPABILITIES: &[KeyCode] = &[
     KeyCode::KEY_HOME,  KeyCode::KEY_END,   KeyCode::KEY_PAGEUP,   KeyCode::KEY_PAGEDOWN,
     KeyCode::KEY_TAB,   KeyCode::KEY_ENTER, KeyCode::KEY_BACKSPACE, KeyCode::KEY_DELETE,
     KeyCode::KEY_ESC,   KeyCode::KEY_SPACE,
-    // Modifiers (KEY_LEFTMETA used by the LockScreen Super+L fallback)
+    // Modifiers (KEY_LEFTMETA used by the LockScreen Super+L fallback;
+    // KEY_RIGHTALT is AltGr, the level-3 shift most non-US layouts need)
     KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_LEFTALT, KeyCode::KEY_LEFTMETA,
+    KeyCode::KEY_RIGHTALT, KeyCode::KEY_RIGHTSHIFT,
+    // The ISO 105-key extra (`<>` left of Z) — a plain character key on
+    // every European layout, absent from ANSI boards.
+    KeyCode::KEY_102ND,
     // Function keys
     KeyCode::KEY_F1,  KeyCode::KEY_F2,  KeyCode::KEY_F3,  KeyCode::KEY_F4,
     KeyCode::KEY_F5,  KeyCode::KEY_F6,  KeyCode::KEY_F7,  KeyCode::KEY_F8,
@@ -240,6 +301,10 @@ const KEY_CAPABILITIES: &[KeyCode] = &[
     KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE,
     KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA,
 ];
+
+/// [`KEY_CAPABILITIES`] as a set, for the layout inversion to filter on.
+static KEY_CAPABILITY_SET: LazyLock<HashSet<KeyCode>> =
+    LazyLock::new(|| KEY_CAPABILITIES.iter().copied().collect());
 
 fn build() -> io::Result<VirtualDevice> {
     let mut keys = AttributeSet::<KeyCode>::default();
