@@ -20,6 +20,10 @@
 //! # Fire several actions back-to-back (0.5 s between each):
 //! sudo ./target/debug/examples/inject_action --delay 2 --between 500 VolumeUp VolumeDown PlayPause
 //!
+//! # Type text through the session keyboard layout (Linux: XKB, no sudo
+//! # needed with the udev rule installed):
+//! ./target/debug/examples/inject_action --delay 3 "TypeText:hello@example.com"
+//!
 //! # Inject a scroll sequence:
 //! sudo ./target/debug/examples/inject_action ScrollDown ScrollDown ScrollDown ScrollUp
 //! ```
@@ -52,6 +56,11 @@ fn parse_action(s: &str) -> Result<Action, String> {
             .parse::<KeyCombo>()
             .map(Action::CustomShortcut)
             .map_err(|error| error.to_string());
+    }
+
+    // `TypeText` takes free text, so it gets the same prefix treatment.
+    if let Some(text) = s.strip_prefix("TypeText:") {
+        return Ok(Action::TypeText(text.to_string()));
     }
 
     // Every other variant is a serde unit variant that deserializes straight
