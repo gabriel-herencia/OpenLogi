@@ -100,7 +100,14 @@ fn from_etc_default_keyboard() -> Option<LayoutNames> {
     let value = |name: &str| {
         text.lines()
             .filter_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
-            .map(|v| v.trim().trim_matches('"').split(',').next().unwrap_or("").to_string())
+            .map(|v| {
+                v.trim()
+                    .trim_matches('"')
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
             .next()
     };
     let layout = value("XKBLAYOUT").filter(|l| !l.is_empty())?;

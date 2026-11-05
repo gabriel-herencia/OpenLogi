@@ -218,15 +218,14 @@ pub(super) fn type_text(text: &str) {
 /// themselves are looked up through the same map.
 fn type_unicode_fallback(ch: char, map: &std::collections::HashMap<char, keymap::Stroke>) {
     let hex = format!("{:x}", u32::from(ch));
-    let Some(digits) = hex
-        .chars()
-        .map(|d| map.get(&d))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let Some(digits) = hex.chars().map(|d| map.get(&d)).collect::<Option<Vec<_>>>() else {
         tracing::warn!(?ch, "character unreachable on the session layout — skipped");
         return;
     };
-    press_key(&[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT], KeyCode::KEY_U);
+    press_key(
+        &[KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT],
+        KeyCode::KEY_U,
+    );
     std::thread::sleep(TYPE_TEXT_KEY_GAP);
     for stroke in digits {
         press_key(&stroke.mods, stroke.key);
