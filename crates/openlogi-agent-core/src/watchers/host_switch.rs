@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use openlogi_hid::{
-    ChannelPool, ChannelRegistry, DeviceIoGate, DeviceRoute, HostSwitchRestoreOutcome,
-    HostSwitchStopReason, PendingHostSwitchRestore, run_host_switch_session, switch_linked_hosts,
+    ChannelPool, ChannelRegistry, DeviceIoGate, DeviceRoute, HostSwitchRequest,
+    HostSwitchRestoreOutcome, HostSwitchStopReason, KeyboardSwitch, PendingHostSwitchRestore,
+    run_host_switch_session, switch_linked_hosts,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -106,7 +107,7 @@ enum RestorePhase {
 struct Recovery {
     link: HostSwitchLink,
     epoch: SessionEpoch,
-    requested_host: Option<u8>,
+    request: Option<HostSwitchRequest>,
     restore: RestorePhase,
 }
 
@@ -132,7 +133,18 @@ impl HostSwitchSlot {
 #[derive(Clone)]
 struct TransitionIntent {
     link: HostSwitchLink,
-    host: u8,
+    request: HostSwitchRequest,
+}
+
+impl TransitionIntent {
+    /// Whether this press still asks for a transition.
+    ///
+    /// A keyboard its firmware already switched is leaving this host, and its
+    /// link leaves inventory with it — the targets must follow regardless.
+    fn is_current(&self, published: &[HostSwitchLink], terminal: bool) -> bool {
+        !terminal
+            && (self.request.keyboard == KeyboardSwitch::Firmware || published.contains(&self.link))
+    }
 }
 
 enum TransitionPhase {
@@ -146,7 +158,7 @@ struct SessionCompletion {
 }
 
 struct SessionResult {
-    requested_host: Option<u8>,
+    request: Option<HostSwitchRequest>,
     pending_restore: Option<PendingHostSwitchRestore>,
     failed: bool,
 }
@@ -206,20 +218,27 @@ impl HostSwitchManagerState {
     fn reconcile_transition(&mut self, published: &[HostSwitchLink], terminal: bool) {
         if matches!(
             &self.transition,
-            Some(TransitionPhase::Waiting(intent)) if terminal || !published.contains(&intent.link)
+            Some(TransitionPhase::Waiting(intent)) if !intent.is_current(published, terminal)
         ) {
             self.transition = None;
         }
     }
 
     fn begin_transition(&mut self, terminal: bool) -> Option<TransitionIntent> {
-        if terminal || self.has_running_sessions() || self.has_pending_restores() {
+        if terminal || self.has_running_sessions() {
             return None;
         }
-        let Some(TransitionPhase::Waiting(intent)) = self
-            .transition
-            .take_if(|phase| matches!(phase, TransitionPhase::Waiting(_)))
-        else {
+        // A restore owed to a keyboard its firmware moved away can only land
+        // once it returns; its targets must not wait for that.
+        let has_blocking_restores = self.has_pending_restores();
+        let Some(TransitionPhase::Waiting(intent)) = self.transition.take_if(|phase| {
+            matches!(
+                phase,
+                TransitionPhase::Waiting(intent)
+                    if !has_blocking_restores
+                        || intent.request.keyboard == KeyboardSwitch::Firmware
+            )
+        }) else {
             return None;
         };
         self.transition = Some(TransitionPhase::Running);
@@ -285,7 +304,7 @@ impl HostSwitchManagerState {
                 continue;
             };
             if !published.contains(&recovery.link) {
-                recovery.requested_host = None;
+                recovery.request = None;
             }
             let RestorePhase::Ready { retry_at, .. } = &recovery.restore else {
                 continue;
@@ -365,27 +384,50 @@ impl HostSwitchManagerState {
         if result.failed {
             debug!(route = %session.link.keyboard, "host switch session ended");
         }
-        let request_is_current = !terminal && published.contains(&session.link);
-        if let Some(token) = result.pending_restore {
-            self.slots.push(HostSwitchSlot::Recovering(Recovery {
-                link: session.link,
-                epoch: session.epoch,
-                requested_host: result.requested_host.filter(|_| request_is_current),
-                restore: RestorePhase::Ready {
-                    token,
+        let link_is_current = !terminal && published.contains(&session.link);
+        let intent = result
+            .request
+            .map(|request| TransitionIntent {
+                link: session.link.clone(),
+                request,
+            })
+            .filter(|intent| intent.is_current(published, terminal));
+        match (result.pending_restore, intent) {
+            // The firmware already moved the keyboard, so the restore it is
+            // owed can only land once it returns. Its targets follow now.
+            (Some(token), Some(intent)) if intent.request.keyboard == KeyboardSwitch::Firmware => {
+                self.slots.push(HostSwitchSlot::Recovering(Recovery {
+                    link: session.link,
+                    epoch: session.epoch,
+                    request: None,
+                    restore: RestorePhase::Ready {
+                        token,
+                        retry_at: Instant::now() + RETRY_DELAY,
+                    },
+                }));
+                self.transition = Some(TransitionPhase::Waiting(intent));
+            }
+            (Some(token), intent) => {
+                self.slots.push(HostSwitchSlot::Recovering(Recovery {
+                    link: session.link,
+                    epoch: session.epoch,
+                    request: intent.map(|intent| intent.request),
+                    restore: RestorePhase::Ready {
+                        token,
+                        retry_at: Instant::now() + RETRY_DELAY,
+                    },
+                }));
+            }
+            (None, Some(intent)) => {
+                self.transition = Some(TransitionPhase::Waiting(intent));
+            }
+            (None, None) if result.failed && link_is_current => {
+                self.slots.push(HostSwitchSlot::Restarting {
+                    link: session.link,
                     retry_at: Instant::now() + RETRY_DELAY,
-                },
-            }));
-        } else if let Some(host) = result.requested_host.filter(|_| request_is_current) {
-            self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
-                link: session.link,
-                host,
-            }));
-        } else if result.failed && request_is_current {
-            self.slots.push(HostSwitchSlot::Restarting {
-                link: session.link,
-                retry_at: Instant::now() + RETRY_DELAY,
-            });
+                });
+            }
+            (None, None) => {}
         }
     }
 
@@ -412,12 +454,15 @@ impl HostSwitchManagerState {
                 self.slots.push(HostSwitchSlot::Recovering(recovery));
             }
             Ok(HostSwitchRestoreOutcome::Restored) => {
-                let request_is_current = !terminal && published.contains(&recovery.link);
-                if let Some(host) = recovery.requested_host.filter(|_| request_is_current) {
-                    self.transition = Some(TransitionPhase::Waiting(TransitionIntent {
+                let intent = recovery
+                    .request
+                    .map(|request| TransitionIntent {
                         link: recovery.link,
-                        host,
-                    }));
+                        request,
+                    })
+                    .filter(|intent| intent.is_current(published, terminal));
+                if let Some(intent) = intent {
+                    self.transition = Some(TransitionPhase::Waiting(intent));
                 }
             }
             Err(error) => {
@@ -560,9 +605,9 @@ fn spawn_session(
             .await
             {
                 Ok(outcome) => {
-                    let (requested_host, pending_restore) = outcome.into_parts();
+                    let (request, pending_restore) = outcome.into_parts();
                     SessionResult {
-                        requested_host,
+                        request,
                         pending_restore,
                         failed: false,
                     }
@@ -571,7 +616,7 @@ fn spawn_session(
                     let (error, pending_restore) = failure.into_parts();
                     debug!(%error, route = %session_link.keyboard, "host switch session ended");
                     SessionResult {
-                        requested_host: None,
+                        request: None,
                         pending_restore,
                         failed: true,
                     }
@@ -626,13 +671,13 @@ async fn run_transition(
     let _lease = receiver_access
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
         .await;
-    if !device_io.allows_io() || !links.borrow().contains(&intent.link) {
+    if !device_io.allows_io() || !intent.is_current(&links.borrow(), false) {
         return;
     }
     match switch_linked_hosts(
         &intent.link.keyboard,
         &intent.link.targets,
-        intent.host,
+        intent.request,
         &channel_pool,
     )
     .await
@@ -640,7 +685,7 @@ async fn run_transition(
         Ok(true) => wait_for_departure(&mut links, &intent.link.keyboard).await,
         Ok(false) => {}
         Err(error) => {
-            debug!(%error, route = %intent.link.keyboard, host = intent.host, "keyboard host switch failed");
+            debug!(%error, route = %intent.link.keyboard, host = intent.request.host, "keyboard host switch failed");
         }
     }
 }
@@ -722,17 +767,137 @@ mod tests {
         assert!(state.slots.iter().any(|slot| slot.keyboard() == &route(1)));
     }
 
+    fn intent(host: u8, keyboard: KeyboardSwitch) -> TransitionIntent {
+        TransitionIntent {
+            link: link(2),
+            request: HostSwitchRequest { host, keyboard },
+        }
+    }
+
     #[test]
     fn stale_link_invalidates_transition_intent() {
         let mut state = HostSwitchManagerState::new();
-        state.transition = Some(TransitionPhase::Waiting(TransitionIntent {
-            link: link(2),
-            host: 1,
-        }));
+        state.transition = Some(TransitionPhase::Waiting(intent(
+            1,
+            KeyboardSwitch::OpenLogi,
+        )));
 
         state.reconcile_transition(&[link(3)], false);
         assert!(state.transition.is_none());
         assert!(state.begin_transition(false).is_none());
+    }
+
+    #[test]
+    fn firmware_switched_keyboard_departure_keeps_its_targets_transition() {
+        // The keyboard's own firmware moved it, so its link leaves inventory
+        // with it; the targets must still follow.
+        let mut state = HostSwitchManagerState::new();
+        state.transition = Some(TransitionPhase::Waiting(intent(
+            1,
+            KeyboardSwitch::Firmware,
+        )));
+
+        state.reconcile_transition(&[], false);
+        let started = state
+            .begin_transition(false)
+            .expect("a departed keyboard's targets must still be switched");
+        assert_eq!(started.request.host, 1);
+    }
+
+    #[test]
+    fn terminal_shutdown_drops_a_firmware_switched_transition() {
+        let mut state = HostSwitchManagerState::new();
+        state.transition = Some(TransitionPhase::Waiting(intent(
+            1,
+            KeyboardSwitch::Firmware,
+        )));
+
+        state.reconcile_transition(&[], true);
+        assert!(state.transition.is_none());
+    }
+
+    #[test]
+    fn firmware_switched_press_starts_transition_after_its_link_departs() {
+        let mut state = HostSwitchManagerState::new();
+        let (stop, _stop_rx) = oneshot::channel();
+        state.slots.push(HostSwitchSlot::Running(RunningSession {
+            link: link(2),
+            epoch: SessionEpoch(1),
+            phase: SessionPhase::Active(stop),
+        }));
+        let request = HostSwitchRequest {
+            host: 1,
+            keyboard: KeyboardSwitch::Firmware,
+        };
+
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Session(SessionCompletion {
+                epoch: SessionEpoch(1),
+                result: Ok(SessionResult {
+                    request: Some(request),
+                    pending_restore: None,
+                    failed: false,
+                }),
+            }),
+            &[],
+            false,
+        );
+
+        let started = state
+            .begin_transition(false)
+            .expect("the press must still switch the targets");
+        assert_eq!(started.request, request);
+    }
+
+    #[test]
+    fn diverted_press_is_dropped_once_its_link_departs() {
+        let mut state = HostSwitchManagerState::new();
+        let (stop, _stop_rx) = oneshot::channel();
+        state.slots.push(HostSwitchSlot::Running(RunningSession {
+            link: link(2),
+            epoch: SessionEpoch(1),
+            phase: SessionPhase::Active(stop),
+        }));
+
+        handle_manager_event(
+            &mut state,
+            ManagerEvent::Session(SessionCompletion {
+                epoch: SessionEpoch(1),
+                result: Ok(SessionResult {
+                    request: Some(HostSwitchRequest {
+                        host: 1,
+                        keyboard: KeyboardSwitch::OpenLogi,
+                    }),
+                    pending_restore: None,
+                    failed: false,
+                }),
+            }),
+            &[],
+            false,
+        );
+
+        assert!(state.begin_transition(false).is_none());
+    }
+
+    #[test]
+    fn firmware_switched_transition_does_not_wait_for_the_departed_keyboards_restore() {
+        let mut state = HostSwitchManagerState::new();
+        state.slots.push(HostSwitchSlot::Recovering(Recovery {
+            link: link(2),
+            epoch: SessionEpoch(1),
+            request: None,
+            restore: RestorePhase::Restoring,
+        }));
+        state.transition = Some(TransitionPhase::Waiting(intent(
+            1,
+            KeyboardSwitch::Firmware,
+        )));
+
+        assert!(
+            state.begin_transition(false).is_some(),
+            "the restore can only land once the keyboard returns"
+        );
     }
 
     #[test]
@@ -741,7 +906,7 @@ mod tests {
         state.slots.push(HostSwitchSlot::Recovering(Recovery {
             link: link(2),
             epoch: SessionEpoch(1),
-            requested_host: None,
+            request: None,
             restore: RestorePhase::Restoring,
         }));
 
@@ -757,7 +922,7 @@ mod tests {
         state.slots.push(HostSwitchSlot::Recovering(Recovery {
             link: link(2),
             epoch: SessionEpoch(1),
-            requested_host: None,
+            request: None,
             restore: RestorePhase::Restoring,
         }));
 
@@ -794,13 +959,13 @@ mod tests {
         state.slots.push(HostSwitchSlot::Recovering(Recovery {
             link: link(2),
             epoch: SessionEpoch(1),
-            requested_host: None,
+            request: None,
             restore: RestorePhase::Restoring,
         }));
-        state.transition = Some(TransitionPhase::Waiting(TransitionIntent {
-            link: link(2),
-            host: 2,
-        }));
+        state.transition = Some(TransitionPhase::Waiting(intent(
+            2,
+            KeyboardSwitch::OpenLogi,
+        )));
         assert!(state.begin_transition(false).is_none());
         assert!(matches!(
             state.transition,
@@ -815,7 +980,7 @@ mod tests {
             &[link(2)],
             false,
         );
-        assert_eq!(state.begin_transition(false).unwrap().host, 2);
+        assert_eq!(state.begin_transition(false).unwrap().request.host, 2);
         // Another manager wake while switching must not remove Running.
         assert!(state.begin_transition(false).is_none());
         assert!(state.terminal_completion(true).is_none());

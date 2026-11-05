@@ -3,7 +3,7 @@
 
 use std::{fmt, sync::Arc};
 
-use super::{ArmedControl, HostSwitchError, restore_host_controls};
+use super::{ArmedControl, HostSwitchError, HostSwitchRequest, restore_host_controls};
 use crate::session::restore::{
     PendingRestore, RestoreOutcome, RestorePlan, SessionFailure, rollback_start,
 };
@@ -14,13 +14,13 @@ use crate::{ChannelRegistry, DeviceIoGate, SharedChannel, reprog_controls::Repro
 pub enum HostSwitchSessionOutcome {
     /// Every host control was restored before the session returned.
     Restored {
-        /// Host requested by the keyboard, if the session ended on a key press.
-        requested_host: Option<u8>,
+        /// The host key press the session ended on, if any.
+        request: Option<HostSwitchRequest>,
     },
     /// Restoration is incomplete and must precede any successor session.
     RestorePending {
-        /// Host requested before teardown began, if any.
-        requested_host: Option<u8>,
+        /// The host key press made before teardown began, if any.
+        request: Option<HostSwitchRequest>,
         /// Owned capability for retrying restoration on a current publication.
         restore: PendingHostSwitchRestore,
     },
@@ -29,13 +29,10 @@ pub enum HostSwitchSessionOutcome {
 impl HostSwitchSessionOutcome {
     /// Split the transition intent from any retained firmware ownership.
     #[must_use]
-    pub fn into_parts(self) -> (Option<u8>, Option<PendingHostSwitchRestore>) {
+    pub fn into_parts(self) -> (Option<HostSwitchRequest>, Option<PendingHostSwitchRestore>) {
         match self {
-            Self::Restored { requested_host } => (requested_host, None),
-            Self::RestorePending {
-                requested_host,
-                restore,
-            } => (requested_host, Some(restore)),
+            Self::Restored { request } => (request, None),
+            Self::RestorePending { request, restore } => (request, Some(restore)),
         }
     }
 }
@@ -121,7 +118,8 @@ pub(super) async fn rollback_host_switch_start(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        HostSwitchStop, HostSwitchStopReason, monitor_host_switch, run_host_switch_session,
+        HostSwitchStop, HostSwitchStopReason, KeyboardSwitch, monitor_host_switch,
+        run_host_switch_session,
     };
     use super::*;
     use crate::DeviceRoute;
@@ -186,12 +184,9 @@ mod tests {
             .await
             .expect("failed restoration must return ownership instead of looping");
             let pending = match outcome {
-                Ok(HostSwitchSessionOutcome::RestorePending {
-                    requested_host,
-                    restore,
-                }) => {
+                Ok(HostSwitchSessionOutcome::RestorePending { request, restore }) => {
                     assert!(!partial_arm);
-                    assert_eq!(requested_host, None);
+                    assert_eq!(request, None);
                     restore
                 }
                 Err(failure) => {
@@ -313,10 +308,14 @@ mod tests {
 
         let (_stop, stopped) = tokio::sync::oneshot::channel();
         let (press, presses) = tokio::sync::mpsc::unbounded_channel();
-        press.send(2).unwrap();
+        let request = HostSwitchRequest {
+            host: 2,
+            keyboard: KeyboardSwitch::Firmware,
+        };
+        press.send(request).unwrap();
         assert_eq!(
             monitored(stopped, presses).await,
-            HostSwitchStop::Pressed(2)
+            HostSwitchStop::Pressed(request)
         );
     }
 

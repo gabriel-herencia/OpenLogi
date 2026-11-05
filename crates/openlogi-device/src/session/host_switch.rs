@@ -60,10 +60,41 @@ const HOST_TASK_IDS: [(reprog_controls::TaskId, u8); 3] = [
 ];
 const HIDPP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Who moves the keyboard once one of its host keys was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardSwitch {
+    /// The key was diverted, so the keyboard stays until OpenLogi switches it
+    /// — after its targets, while it can still reach them.
+    OpenLogi,
+    /// The key only reported an analytics event: the firmware has already
+    /// moved the keyboard, and only its targets are left to follow.
+    Firmware,
+}
+
+/// A host key press: the zero-based host asked for, and who moves the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSwitchRequest {
+    /// Zero-based host the keyboard asked for.
+    pub host: u8,
+    /// Whether OpenLogi or the keyboard's firmware moves the keyboard there.
+    pub keyboard: KeyboardSwitch,
+}
+
 #[derive(Clone, Copy)]
 enum ReportingMode {
     Diverted,
     Analytics,
+}
+
+impl ReportingMode {
+    /// A diverted key never reaches the firmware's own host switch; an
+    /// analytics key does, and is reported only alongside it.
+    fn keyboard_switch(self) -> KeyboardSwitch {
+        match self {
+            Self::Diverted => KeyboardSwitch::OpenLogi,
+            Self::Analytics => KeyboardSwitch::Firmware,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -165,8 +196,8 @@ pub async fn run_host_switch_session(
         else {
             return;
         };
-        if let Some(host) = event_host(&event_controls, event) {
-            let _ = press_tx.send(host);
+        if let Some(request) = event_request(&event_controls, event) {
+            let _ = press_tx.send(request);
         }
     });
 
@@ -185,10 +216,10 @@ pub async fn run_host_switch_session(
     .await;
 
     drop(listener);
-    let requested_host = stop.requested_host();
+    let request = stop.request();
     let Some(mut pending) = PendingHostSwitchRestore::new(&shared, controls.feature_index(), armed)
     else {
-        return Ok(HostSwitchSessionOutcome::Restored { requested_host });
+        return Ok(HostSwitchSessionOutcome::Restored { request });
     };
     let reuse_armed_channel = match stop {
         // A press does not retire the channel: teardown may write through it
@@ -202,17 +233,14 @@ pub async fn run_host_switch_session(
     }
     if !device_io.allows_io() {
         return Ok(HostSwitchSessionOutcome::RestorePending {
-            requested_host,
+            request,
             restore: pending,
         });
     }
     Ok(match pending.retry(registry).await {
-        HostSwitchRestoreOutcome::Restored => HostSwitchSessionOutcome::Restored { requested_host },
+        HostSwitchRestoreOutcome::Restored => HostSwitchSessionOutcome::Restored { request },
         HostSwitchRestoreOutcome::RestorePending(restore) => {
-            HostSwitchSessionOutcome::RestorePending {
-                requested_host,
-                restore,
-            }
+            HostSwitchSessionOutcome::RestorePending { request, restore }
         }
     })
 }
@@ -220,8 +248,8 @@ pub async fn run_host_switch_session(
 /// Why monitoring an armed host-switch session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostSwitchStop {
-    /// The keyboard asked for this zero-based host.
-    Pressed(u8),
+    /// A host key was pressed.
+    Pressed(HostSwitchRequest),
     /// Teardown was requested while inventory still published the channel
     /// that armed the session.
     Shutdown,
@@ -232,9 +260,9 @@ enum HostSwitchStop {
 }
 
 impl HostSwitchStop {
-    fn requested_host(self) -> Option<u8> {
+    fn request(self) -> Option<HostSwitchRequest> {
         match self {
-            Self::Pressed(host) => Some(host),
+            Self::Pressed(request) => Some(request),
             Self::Shutdown | Self::ChannelChanged => None,
         }
     }
@@ -252,7 +280,7 @@ impl HostSwitchStop {
 
 async fn monitor_host_switch(
     mut shutdown: oneshot::Receiver<HostSwitchStopReason>,
-    presses: &mut mpsc::UnboundedReceiver<u8>,
+    presses: &mut mpsc::UnboundedReceiver<HostSwitchRequest>,
     registry: &ChannelRegistry,
     shared: &SharedChannel,
     mut device_io: DeviceIoGate,
@@ -279,9 +307,9 @@ async fn monitor_host_switch(
                     HostSwitchStopReason::DeviceLost => HostSwitchStop::ChannelChanged,
                 };
             }
-            host = presses.recv() => {
-                return match host {
-                    Some(host) => HostSwitchStop::Pressed(host),
+            request = presses.recv() => {
+                return match request {
+                    Some(request) => HostSwitchStop::Pressed(request),
                     None => HostSwitchStop::for_current_publication(registry, shared),
                 };
             }
@@ -294,27 +322,52 @@ async fn monitor_host_switch(
     }
 }
 
-/// Move reachable targets to `host`, then move the keyboard last.
+/// Move reachable targets to the requested host, then the keyboard last.
 ///
-/// Returns whether the keyboard actually changed hosts.
+/// When the keyboard's firmware moved it on its own
+/// ([`KeyboardSwitch::Firmware`]), the keyboard has already left this host:
+/// it is neither validated nor addressed, and only the targets are switched.
+///
+/// Returns whether the keyboard changed hosts.
 pub async fn switch_linked_hosts(
     keyboard: &DeviceRoute,
     targets: &[DeviceRoute],
-    host: u8,
+    request: HostSwitchRequest,
     channel_pool: &ChannelPool,
 ) -> Result<bool, HostSwitchError> {
-    let channel = open_channel(channel_pool, keyboard, "opening keyboard channel")
-        .await?
-        .ok_or(HostSwitchError::KeyboardNotFound)?;
+    let opened = open_channel(channel_pool, keyboard, "opening keyboard channel").await;
+    let channel = match request.keyboard {
+        KeyboardSwitch::OpenLogi => Some(opened?.ok_or(HostSwitchError::KeyboardNotFound)?),
+        // The keyboard is gone, but the receiver it was paired through
+        // still reaches the targets sharing it.
+        KeyboardSwitch::Firmware => opened.ok().flatten(),
+    };
+    switch_linked_hosts_on(keyboard, channel.as_ref(), targets, request, channel_pool).await
+}
+
+async fn switch_linked_hosts_on(
+    keyboard: &DeviceRoute,
+    keyboard_channel: Option<&Arc<HidppChannel>>,
+    targets: &[DeviceRoute],
+    request: HostSwitchRequest,
+    channel_pool: &ChannelPool,
+) -> Result<bool, HostSwitchError> {
+    let host = request.host;
     // Validate the keyboard's own move before touching anything: preparation is
     // read-only, but it is the step that rejects an unpaired host slot, and
     // discovering that *after* the mice have moved would strand them on a host
     // the keyboard never reaches. Applying it still happens last, because once
     // the keyboard leaves this host its channel can no longer command a mouse
     // sharing the same receiver.
-    let keyboard_change = prepare_host_change_on(&channel, keyboard.device_index(), host).await?;
+    let keyboard_change = match (request.keyboard, keyboard_channel) {
+        (KeyboardSwitch::OpenLogi, Some(channel)) => {
+            Some(prepare_host_change_on(channel, keyboard.device_index(), host).await?)
+        }
+        (KeyboardSwitch::OpenLogi, None) => return Err(HostSwitchError::KeyboardNotFound),
+        (KeyboardSwitch::Firmware, _) => None,
+    };
     for target in targets {
-        match prepare_host_change(target, host, keyboard, &channel, channel_pool).await {
+        match prepare_host_change(target, host, keyboard, keyboard_channel, channel_pool).await {
             Ok(change) => {
                 if let Err(error) = apply_host_change(change).await {
                     debug!(%error, route = %target, host, "linked device host switch failed");
@@ -325,6 +378,10 @@ pub async fn switch_linked_hosts(
             }
         }
     }
+    let Some(keyboard_change) = keyboard_change else {
+        debug!(host, route = %keyboard, "targets followed a firmware host switch");
+        return Ok(true);
+    };
     let changed = apply_host_change(keyboard_change).await?;
     if changed {
         debug!(host, route = %keyboard, "keyboard host switched");
@@ -455,10 +512,10 @@ async fn prepare_host_change(
     target: &DeviceRoute,
     host: u8,
     keyboard: &DeviceRoute,
-    keyboard_channel: &Arc<HidppChannel>,
+    keyboard_channel: Option<&Arc<HidppChannel>>,
     channel_pool: &ChannelPool,
 ) -> Result<PreparedHostChange, HostSwitchError> {
-    if shares_channel(target, keyboard) {
+    if let Some(keyboard_channel) = keyboard_channel.filter(|_| shares_channel(target, keyboard)) {
         prepare_host_change_on(keyboard_channel, target.device_index(), host).await
     } else {
         let channel = open_channel(channel_pool, target, "opening linked device channel")
@@ -614,25 +671,24 @@ fn host_channel(info: reprog_controls::CtrlIdInfo) -> Option<u8> {
         })
 }
 
-fn event_host(
+fn event_request(
     controls: &[ArmedControl],
     event: reprog_controls::ReprogControlsEvent,
-) -> Option<u8> {
-    match event {
+) -> Option<HostSwitchRequest> {
+    let pressed = match event {
         reprog_controls::ReprogControlsEvent::DivertedButtons(cids) => controls
             .iter()
-            .find_map(|control| cids.contains(&control.cid.into()).then_some(control.host)),
-        reprog_controls::ReprogControlsEvent::AnalyticsKeyEvents(events) => {
-            controls.iter().find_map(|control| {
-                events
-                    .iter()
-                    .any(|event| event.cid.0 == control.cid)
-                    .then_some(control.host)
-            })
-        }
+            .find(|control| cids.contains(&control.cid.into())),
+        reprog_controls::ReprogControlsEvent::AnalyticsKeyEvents(events) => controls
+            .iter()
+            .find(|control| events.iter().any(|event| event.cid.0 == control.cid)),
         reprog_controls::ReprogControlsEvent::DivertedRawMouseXy { .. }
         | reprog_controls::ReprogControlsEvent::DivertedRawWheel { .. } => None,
-    }
+    }?;
+    Some(HostSwitchRequest {
+        host: pressed.host,
+        keyboard: pressed.mode.keyboard_switch(),
+    })
 }
 
 #[cfg(test)]

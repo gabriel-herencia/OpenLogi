@@ -3,18 +3,19 @@ use std::sync::Arc;
 use hidpp::channel::HidppChannel;
 
 use super::{
-    ArmedControl, HostSwitchError, HostSwitchRestoreOutcome, PendingHostSwitchRestore,
-    ReportingMode, event_host, host_change_required, host_channel, prepare_host_change_on,
-    restoration_change, rollback_host_switch_start, shares_channel,
+    ArmedControl, HostSwitchError, HostSwitchRequest, HostSwitchRestoreOutcome, KeyboardSwitch,
+    PendingHostSwitchRestore, ReportingMode, event_request, host_change_required, host_channel,
+    prepare_host_change_on, restoration_change, rollback_host_switch_start, shares_channel,
+    switch_linked_hosts_on,
 };
 use crate::backend::NodeId;
 use crate::channel::scripted::{
-    ScriptedRawHidChannel, feature_error, scripted_channel as raw_scripted_channel,
+    ScriptedBackend, ScriptedRawHidChannel, feature_error, scripted_channel as raw_scripted_channel,
 };
 use crate::reprog_controls::{
     AnalyticsKeyEvent, CidReporting, ControlId, CtrlIdInfo, ReprogControlsEvent,
 };
-use crate::{ChannelRegistry, DeviceRoute, SharedChannel, device_io_channel};
+use crate::{ChannelPool, ChannelRegistry, DeviceRoute, SharedChannel, device_io_channel};
 
 /// Feature index the scripted keyboard reports for `0x1814 ChangeHost`.
 const CHANGE_HOST_INDEX: u8 = 0x04;
@@ -23,6 +24,9 @@ const HOSTS_INFO_INDEX: u8 = 0x05;
 
 /// `ErrorType::Busy`, the failure a scripted device answers with.
 const BUSY: u8 = 0x08;
+/// HID++ 1.0 `ErrorType::ResourceError`: the receiver's answer for a paired
+/// device that is not connected to it.
+const DISCONNECTED: u8 = 0x09;
 
 /// What the scripted keyboard's firmware does when asked about `0x1815`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -327,7 +331,7 @@ fn host_controls_are_recognized_by_task_when_cid_varies() {
 }
 
 #[test]
-fn analytics_event_selects_the_matching_host() {
+fn analytics_event_selects_the_matching_host_already_switched_by_firmware() {
     let controls = [ArmedControl {
         cid: 0x00d3,
         host: 2,
@@ -340,8 +344,124 @@ fn analytics_event_selects_the_matching_host() {
         event: 1,
     };
     assert_eq!(
-        event_host(&controls, ReprogControlsEvent::AnalyticsKeyEvents(events)),
-        Some(2)
+        event_request(&controls, ReprogControlsEvent::AnalyticsKeyEvents(events)),
+        Some(HostSwitchRequest {
+            host: 2,
+            keyboard: KeyboardSwitch::Firmware,
+        })
+    );
+}
+
+#[test]
+fn diverted_press_leaves_the_keyboard_switch_to_openlogi() {
+    let controls = [ArmedControl {
+        cid: 0x00d2,
+        host: 1,
+        mode: ReportingMode::Diverted,
+        original: noisy_reporting(),
+    }];
+    assert_eq!(
+        event_request(
+            &controls,
+            ReprogControlsEvent::DivertedButtons([
+                ControlId(0x00d2),
+                ControlId(0),
+                ControlId(0),
+                ControlId(0)
+            ])
+        ),
+        Some(HostSwitchRequest {
+            host: 1,
+            keyboard: KeyboardSwitch::OpenLogi,
+        })
+    );
+}
+
+fn bolt_slot(slot: u8) -> DeviceRoute {
+    DeviceRoute::Bolt {
+        receiver_uid: "aabb".into(),
+        slot,
+    }
+}
+
+/// A receiver whose keyboard on slot 1 has already left for another host —
+/// the receiver answers for it with HID++ 1.0 `ResourceError`, as it does for
+/// a disconnected device — while the mouse on slot 2 still answers.
+fn receiver_after_a_firmware_host_switch(request: &[u8]) -> Option<Vec<u8>> {
+    if request.get(1) == Some(&1) {
+        return Some(vec![0x10, 1, 0x8f, request[2], request[3], DISCONNECTED, 0]);
+    }
+    scripted_keyboard(request, SlotStatus::Reported)
+}
+
+/// Whether `report` is a `setCurrentHost(host)` addressed to `device_index`.
+fn is_set_current_host(report: &[u8], device_index: u8, host: u8) -> bool {
+    report[1] == device_index
+        && report[2] == CHANGE_HOST_INDEX
+        && report[3] >> 4 == 1
+        && report[4] == host
+}
+
+#[tokio::test]
+async fn targets_follow_a_keyboard_its_firmware_already_switched() {
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder(receiver_after_a_firmware_host_switch);
+    let channel = raw_scripted_channel(raw).await;
+    let pool = ChannelPool::with_backend(ScriptedBackend::new(Vec::new()));
+
+    let switched = switch_linked_hosts_on(
+        &bolt_slot(1),
+        Some(&channel),
+        &[bolt_slot(2)],
+        HostSwitchRequest {
+            host: 1,
+            keyboard: KeyboardSwitch::Firmware,
+        },
+        &pool,
+    )
+    .await
+    .expect("a departed keyboard must not abort its targets' switch");
+
+    assert!(switched);
+    let written = handle.written_reports();
+    assert!(
+        written
+            .iter()
+            .any(|report| is_set_current_host(report, 2, 1)),
+        "the mouse must be sent to the keyboard's new host"
+    );
+    assert!(
+        written.iter().all(|report| report[1] != 1),
+        "the departed keyboard must not be addressed"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_keyboard_keeps_its_targets_when_openlogi_must_switch_it() {
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder(receiver_after_a_firmware_host_switch);
+    let channel = raw_scripted_channel(raw).await;
+    let pool = ChannelPool::with_backend(ScriptedBackend::new(Vec::new()));
+
+    switch_linked_hosts_on(
+        &bolt_slot(1),
+        Some(&channel),
+        &[bolt_slot(2)],
+        HostSwitchRequest {
+            host: 1,
+            keyboard: KeyboardSwitch::OpenLogi,
+        },
+        &pool,
+    )
+    .await
+    .expect_err("a keyboard that cannot follow must not strand its targets");
+
+    assert!(
+        handle
+            .written_reports()
+            .iter()
+            .all(|report| !is_set_current_host(report, 2, 1)),
+        "no target may move before the keyboard's own switch is validated"
     );
 }
 
